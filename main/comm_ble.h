@@ -23,9 +23,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "esp_gap_ble_api.h"
+
 void comm_ble_init(void);
 bool comm_ble_is_connected();
 int comm_ble_mtu_now(void);
 void comm_ble_send_packet(unsigned char *data, unsigned int len);
+
+// GAP event hook — allows other modules (e.g. ANT BMS GATTC) to receive GAP events
+void comm_ble_set_gap_hook(void (*hook)(esp_gap_ble_cb_event_t, esp_ble_gap_cb_param_t *));
 
 #endif /* MAIN_COMM_BLE_H_ */

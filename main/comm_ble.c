@@ -421,9 +421,20 @@ static void gatts_check_callback(
 	}
 }
 
+// GAP hook for external modules (ANT BMS GATTC scan events)
+static void (*s_gap_hook)(esp_gap_ble_cb_event_t, esp_ble_gap_cb_param_t *) = NULL;
+
+void comm_ble_set_gap_hook(void (*hook)(esp_gap_ble_cb_event_t, esp_ble_gap_cb_param_t *)) {
+	s_gap_hook = hook;
+}
+
 static void gap_event_handler(
 	esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param
 ) {
+	if (s_gap_hook) {
+		s_gap_hook(event, param);
+	}
+
 	switch (event) {
 		case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
 			adv_config_done &= (~ADV_CFG_FLAG);

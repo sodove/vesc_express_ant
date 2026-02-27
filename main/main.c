@@ -25,6 +25,7 @@
 
 #include "conf_general.h"
 #include "comm_ble.h"
+#include "ant_bms.h"
 #include "comm_uart.h"
 #include "comm_usb.h"
 #include "comm_can.h"
@@ -153,6 +154,11 @@ void app_main(void) {
 
 	if (backup.config.wifi_mode != WIFI_MODE_DISABLED) {
 		comm_wifi_init();
+	}
+
+	// ANT BMS BLE bridge — init after WiFi so OTA stays available on crash
+	if (backup.config.ble_mode == BLE_MODE_OPEN || backup.config.ble_mode == BLE_MODE_ENCRYPTED) {
+		ant_bms_init();
 	}
 
 	nmea_init();
