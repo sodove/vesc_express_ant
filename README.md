@@ -79,6 +79,8 @@ The idea for this bridge was inspired by [kamiyamaQ](https://www.youtube.com/@ka
 
 **WARNING:** This is experimental custom firmware. It may be unstable, cause unexpected behavior, or brick your device. Flash at your own risk. The authors take no responsibility for any damage to your hardware.
 
+**Tested only with [Flipsky FSESC Express](https://flipsky.net/collections/fsesc-express/products/flipsky-fsesc-express).** No other hardware has been tested.
+
 ### How it works
 
 The ESP32-C3 runs three radios simultaneously:
