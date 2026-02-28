@@ -309,29 +309,24 @@ static void ant_bms_send_can(void) {
 
 // Dedicated CAN sending task — runs outside BLE callback context.
 // Wakes on task notification from ant_parse_status, sends BMS CAN frames
-// with per-frame bus idle checks, inter-frame yields, and adaptive backoff.
+// with per-frame bus idle checks and inter-frame yields.
 //
-// Backoff logic: when ant_bms_send_can() aborts mid-burst (bus busy),
-// skip the next N notifications before trying again. This gives config
-// forwarding and logger traffic uncontested bus access.
+// Yielding to config forwarding: comm_can_is_forwarding() returns true
+// while comm_can_send_buffer() is sending a multi-frame burst (config write).
+// We skip our BMS burst entirely if a forwarding is active, and also wait
+// briefly after it finishes to let the TWAI queue drain.
 static void ant_can_task(void *arg) {
 	(void)arg;
-	int backoff = 0;
 
 	for (;;) {
 		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 		if (!m_enabled || !m_connected) continue;
 
-		if (backoff > 0) {
-			backoff--;
-			continue;
-		}
+		// If config forwarding is in progress, skip this burst entirely
+		if (comm_can_is_forwarding()) continue;
 
-		// Check bus before starting burst — if already busy, back off
-		if (!ant_can_bus_idle()) {
-			backoff = 2;  // skip next 2 notifications (~4-6s at 2s poll)
-			continue;
-		}
+		// Also check raw bus idle (catches logger and other traffic)
+		if (!ant_can_bus_idle()) continue;
 
 		ant_bms_send_can();
 	}

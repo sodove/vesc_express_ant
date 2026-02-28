@@ -35,6 +35,7 @@ void comm_can_change_pins(int tx, int rx);
 void comm_can_transmit_eid(uint32_t id, const uint8_t *data, uint8_t len);
 void comm_can_transmit_sid(uint32_t id, const uint8_t *data, uint8_t len);
 void comm_can_send_buffer(uint8_t controller_id, uint8_t *data, unsigned int len, uint8_t send);
+bool comm_can_is_forwarding(void);
 bool comm_can_ping(uint8_t controller_id, HW_TYPE *hw_type);
 
 void comm_can_set_duty(uint8_t controller_id, float duty);

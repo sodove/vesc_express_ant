@@ -38,6 +38,10 @@
 #include "soc/gpio_sig_map.h"
 #include <string.h>
 
+// Config forwarding flag — set during multi-frame CAN bursts (len > 6)
+// so that low-priority senders (e.g. BMS bridge) can yield the bus.
+static volatile bool m_can_fwd_active = false;
+
 // Status messages
 static can_status_msg stat_msgs[CAN_STATUS_MSGS_TO_STORE];
 static can_status_msg_2 stat_msgs_2[CAN_STATUS_MSGS_TO_STORE];
@@ -1022,6 +1026,8 @@ void comm_can_send_buffer(uint8_t controller_id, uint8_t *data, unsigned int len
 		comm_can_transmit_eid(controller_id |
 				((uint32_t)CAN_PACKET_PROCESS_SHORT_BUFFER << 8), send_buffer, ind);
 	} else {
+		m_can_fwd_active = true;
+
 		unsigned int end_a = 0;
 		for (unsigned int i = 0;i < len;i += 7) {
 			if (i > 255) {
@@ -1071,7 +1077,13 @@ void comm_can_send_buffer(uint8_t controller_id, uint8_t *data, unsigned int len
 
 		comm_can_transmit_eid(controller_id |
 				((uint32_t)CAN_PACKET_PROCESS_RX_BUFFER << 8), send_buffer, ind++);
+
+		m_can_fwd_active = false;
 	}
+}
+
+bool comm_can_is_forwarding(void) {
+	return m_can_fwd_active;
 }
 
 /**
