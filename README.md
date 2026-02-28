@@ -126,7 +126,7 @@ All settings are stored in NVS flash and persist across reboots and OTA updates.
 
 The bridge is enabled by default. The default target MAC is `C3:5E:E2:61:94:AE` (hardcoded in `ant_bms.c`). The default poll interval is 2000ms. With WiFi + BLE Peripheral + BLE Central all active, 500ms poll has been tested stable on ESP32-C3, but 2000ms is the safe default.
 
-**Tip:** When changing ESC configuration via VESC Tool through the Express (CAN forwarding), it is recommended to run `ant_bms disable` beforehand and `ant_bms enable` after. The adaptive CAN logic yields to config traffic, but disabling the bridge eliminates any possibility of bus contention during config writes.
+**IMPORTANT: Before changing ESC settings through the Express, run `ant_bms disable` first, then `ant_bms enable` after.** The BMS bridge shares the CAN bus with config forwarding. While adaptive backoff minimizes collisions, config writes (especially with the logger running) may fail with "Parameters truncated" if the bridge is active. Disabling the bridge guarantees a clean bus for config operations.
 
 ### Hardware config
 
@@ -139,7 +139,7 @@ idf.py build -DHW_NAME="sodovaya express"
 ### Safety features
 
 - **Sanity validation**: all parsed values are range-checked before writing to `bms_values` (voltage vs cell count, current, temperatures, SOC/SOH). Invalid frames are dropped entirely.
-- **Adaptive CAN**: each CAN frame checks bus idle before sending; aborts burst immediately if config forwarding traffic is detected. No force-send timeout — ESC handles staleness via its own 2-second `MAX_CAN_AGE_SEC` fail-open.
+- **Adaptive CAN with backoff**: each CAN frame checks bus idle before sending; aborts burst immediately if traffic detected. On collision, backs off for 2 poll cycles (~4-6s) giving config forwarding and logger uncontested access. No force-send timeout — ESC handles staleness via its own 2-second `MAX_CAN_AGE_SEC` fail-open.
 - **Stale data watchdog**: if connected but no valid parse for 30 seconds (BMS stopped responding), forces BLE disconnect and reconnect.
 - **Disconnect cleanup**: on BLE disconnect, `bms_values.update_time` is zeroed so ESC times out and removes BMS current limits (fail-open design).
 
@@ -155,7 +155,7 @@ main/comm_ble.c             Added GAP event hook for GATTC scan coexistence
 main/comm_ble.h             Exported comm_ble_set_gap_hook()
 main/log.c                  Ported upstream race condition fix (m_field_mutex)
 main/main.c                 ant_bms_init() call after WiFi init
-sdkconfig.defaults          GATTC enabled, BLE MAX_ACT=6, increased BT stack sizes
+sdkconfig                   GATTC enabled, BLE/WiFi/LWIP memory-optimized for C3
 ```
 
 ### ANT BMS protocol notes
