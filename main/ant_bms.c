@@ -1218,7 +1218,7 @@ void ant_bms_init(void) {
 	xTimerStart(m_heartbeat_timer, 0);
 
 	// Dedicated CAN task — decoupled from BLE callback context
-	xTaskCreatePinnedToCore(ant_can_task, "ant_can", 2048, NULL, 5, &m_can_task, tskNO_AFFINITY);
+	xTaskCreatePinnedToCore(ant_can_task, "ant_can", 1024, NULL, 5, &m_can_task, tskNO_AFFINITY);
 
 	// Register terminal command
 	terminal_register_command_callback(

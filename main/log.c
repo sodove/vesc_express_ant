@@ -49,7 +49,7 @@ typedef struct {
 	bool updated;
 } log_header;
 
-#define LOG_MAX_FIELDS		120
+#define LOG_MAX_FIELDS		40
 
 char *file_basepath = "/sdcard/";
 
@@ -233,73 +233,74 @@ static void log_task(void *arg) {
 			}
 			xSemaphoreGive(m_field_mutex);
 
-			// Skip row if no fields were updated
+			// Skip row if no fields were updated (but do NOT skip sleep below)
 			bool any_updated = false;
 			for (int i = 0;i < m_field_num;i++) {
 				if (snap_upd[i]) { any_updated = true; break; }
 			}
-			if (!any_updated) { continue; }
 
-			for (int i = 0;i < m_field_num;i++) {
-				if (snap_upd[i]) {
-					fprintf(f_log, "%.*f", snap_prec[i], snap_val[i]);
-				}
-				if (i == (m_field_num - 1)) {
-					if (m_append_time || m_append_gnss_time || m_append_gnss) {
-						fprintf(f_log, ";");
+			if (any_updated) {
+				for (int i = 0;i < m_field_num;i++) {
+					if (snap_upd[i]) {
+						fprintf(f_log, "%.*f", snap_prec[i], snap_val[i]);
 					}
-
-					if (m_append_time) {
-						fprintf(f_log, "%.3f", (float)utils_ms_today() / 1000.0);
-						if (m_append_gnss_time || m_append_gnss) {
+					if (i == (m_field_num - 1)) {
+						if (m_append_time || m_append_gnss_time || m_append_gnss) {
 							fprintf(f_log, ";");
 						}
-					}
 
-					if (m_append_gnss_time) {
-						if (gga_updated) {
-							fprintf(f_log, "%.3f", (float)s->gga.ms_today / 1000.0);
+						if (m_append_time) {
+							fprintf(f_log, "%.3f", (float)utils_ms_today() / 1000.0);
+							if (m_append_gnss_time || m_append_gnss) {
+								fprintf(f_log, ";");
+							}
 						}
+
+						if (m_append_gnss_time) {
+							if (gga_updated) {
+								fprintf(f_log, "%.3f", (float)s->gga.ms_today / 1000.0);
+							}
+							if (m_append_gnss) {
+								fprintf(f_log, ";");
+							}
+						}
+
 						if (m_append_gnss) {
+							if (gga_updated) {
+								fprintf(f_log, "%.8f", s->gga.lat);
+							}
 							fprintf(f_log, ";");
+
+							if (gga_updated) {
+								fprintf(f_log, "%.8f", s->gga.lon);
+							}
+							fprintf(f_log, ";");
+
+							if (gga_updated) {
+								fprintf(f_log, "%.2f", s->gga.height);
+							}
+							fprintf(f_log, ";");
+
+							if (gga_updated) {
+								fprintf(f_log, "%.2f", s->gga.h_dop * 4.0);
+							}
+							fprintf(f_log, ";");
+
+							if (rmc_updated) {
+								fprintf(f_log, "%.2f", s->rmc.speed * 3.6);
+							}
 						}
+
+						fprintf(f_log, "\n");
+					} else {
+						fprintf(f_log, ";");
 					}
-
-					if (m_append_gnss) {
-						if (gga_updated) {
-							fprintf(f_log, "%.8f", s->gga.lat);
-						}
-						fprintf(f_log, ";");
-
-						if (gga_updated) {
-							fprintf(f_log, "%.8f", s->gga.lon);
-						}
-						fprintf(f_log, ";");
-
-						if (gga_updated) {
-							fprintf(f_log, "%.2f", s->gga.height);
-						}
-						fprintf(f_log, ";");
-
-						if (gga_updated) {
-							fprintf(f_log, "%.2f", s->gga.h_dop * 4.0);
-						}
-						fprintf(f_log, ";");
-
-						if (rmc_updated) {
-							fprintf(f_log, "%.2f", s->rmc.speed * 3.6);
-						}
-					}
-
-					fprintf(f_log, "\n");
-				} else {
-					fprintf(f_log, ";");
 				}
-			}
 
-			if (UTILS_AGE_S(tick_last_fsync) > 2.0) {
-				tick_last_fsync = xTaskGetTickCount();
-				fsync(fileno(f_log));
+				if (UTILS_AGE_S(tick_last_fsync) > 2.0) {
+					tick_last_fsync = xTaskGetTickCount();
+					fsync(fileno(f_log));
+				}
 			}
 		}
 
@@ -309,8 +310,8 @@ static void log_task(void *arg) {
 
 		float task_time = (float)(utils_ms_tot() - ms_last) / 1000.0;
 		int sleep_time = (int)((float)configTICK_RATE_HZ  * ((1.0 / m_rate_hz) - task_time));
-		if (sleep_time < 0) {
-			sleep_time = 1;
+		if (sleep_time < 2) {
+			sleep_time = 2;  // Floor: ~20ms yield to prevent CPU starvation on slow SD
 		}
 		vTaskDelay(sleep_time);
 		ms_last = utils_ms_tot();
