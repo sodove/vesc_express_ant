@@ -34,6 +34,8 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
+#include "driver/twai.h"
+
 #include "bms.h"
 #include "comm_ble.h"
 #include "commands.h"
@@ -344,7 +346,25 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 	val->can_id = backup.config.controller_id;
 	val->update_time = xTaskGetTickCount();
 
-	bms_send_status_can();
+	// Adaptive CAN send: check bus load before sending ~22 BMS packets.
+	// If bus is busy (config forwarding etc), back off automatically.
+	// If bus is idle, send every poll cycle (= m_poll_interval_ms).
+	// Force send at least every 10s even under load.
+	static uint32_t last_can_send = 0;
+	uint32_t now = xTaskGetTickCount();
+	uint32_t elapsed = now - last_can_send;
+
+	twai_status_info_t can_info;
+	bool bus_idle = (twai_get_status_info(&can_info) == ESP_OK &&
+		can_info.msgs_to_tx == 0);
+
+	uint32_t interval = m_poll_interval_ms < 500 ? 500 : m_poll_interval_ms;
+
+	if ((bus_idle && elapsed >= pdMS_TO_TICKS(interval)) ||
+		elapsed >= pdMS_TO_TICKS(10000)) {
+		last_can_send = now;
+		bms_send_status_can();
+	}
 }
 
 // ============================================================================
