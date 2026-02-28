@@ -30,6 +30,7 @@
 #include "esp_gap_ble_api.h"
 #include "esp_gattc_api.h"
 #include "esp_log.h"
+#include "esp_system.h"
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -125,6 +126,9 @@ static volatile uint32_t m_last_parse_time = 0;
 static TimerHandle_t m_poll_timer = NULL;
 static TimerHandle_t m_reconnect_timer = NULL;
 static TimerHandle_t m_heartbeat_timer = NULL;
+
+// Dedicated CAN task — sends BMS frames outside BLE callback context
+static TaskHandle_t m_can_task = NULL;
 
 // ============================================================================
 // CRC-16/MODBUS (reflected poly 0xA001)
@@ -301,6 +305,18 @@ static void ant_bms_send_can(void) {
 		((v->is_balancing ? 1 : 0) << 1) |
 		((v->is_charge_allowed ? 1 : 0) << 2);
 	ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_SOC_SOH_TEMP_STAT << 8), buf, si);
+}
+
+// Dedicated CAN sending task — runs outside BLE callback context.
+// Wakes on task notification from ant_parse_status, sends BMS CAN frames
+// with per-frame bus idle checks and inter-frame yields.
+static void ant_can_task(void *arg) {
+	(void)arg;
+	for (;;) {
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if (!m_enabled || !m_connected) continue;
+		ant_bms_send_can();
+	}
 }
 
 static void ant_parse_status(const uint8_t *buf, int frame_len) {
@@ -526,25 +542,17 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 	val->can_id = backup.config.controller_id;
 	val->update_time = xTaskGetTickCount();
 
-	// Adaptive CAN send with inter-frame yields.
-	// Unlike bms_send_status_can() which blasts ~22 frames in a tight loop
-	// (overflowing the 20-entry TX queue), we send only essential packets
-	// with vTaskDelay(1) between each to let CAN forwarding traffic through.
-	// Only send when bus is idle — no force timeout, ESC handles staleness
-	// via MAX_CAN_AGE_SEC (2s) fail-open on its own.
+	// Notify dedicated CAN task to send BMS frames.
+	// Decoupled from BLE callback context to avoid blocking BTC task
+	// with vTaskDelay and to reduce stack pressure.
 	static uint32_t last_can_send = 0;
 	uint32_t now = xTaskGetTickCount();
 	uint32_t elapsed = now - last_can_send;
-
-	twai_status_info_t can_info;
-	bool bus_idle = (twai_get_status_info(&can_info) == ESP_OK &&
-		can_info.msgs_to_tx == 0);
-
 	uint32_t interval = m_poll_interval_ms < 500 ? 500 : m_poll_interval_ms;
 
-	if (bus_idle && elapsed >= pdMS_TO_TICKS(interval)) {
+	if (elapsed >= pdMS_TO_TICKS(interval)) {
 		last_can_send = now;
-		ant_bms_send_can();
+		if (m_can_task) xTaskNotifyGive(m_can_task);
 	}
 }
 
@@ -754,8 +762,41 @@ static const char *state_str(void) {
 
 static void heartbeat_timer_cb(TimerHandle_t timer) {
 	(void)timer;
-	commands_printf("ANT BMS: [hb v4] state=%s if=%d c=%d",
-		state_str(), m_gattc_if, m_connected);
+
+	// --- System resource monitoring ---
+	uint32_t heap_free = esp_get_free_heap_size();
+	uint32_t heap_min = esp_get_minimum_free_heap_size();
+	UBaseType_t stk_tmr = uxTaskGetStackHighWaterMark(NULL);  // timer daemon
+	UBaseType_t stk_can = m_can_task ? uxTaskGetStackHighWaterMark(m_can_task) : 0;
+
+	// CPU idle % via FreeRTOS runtime stats (IDLE task runtime / total)
+	static uint32_t prev_idle_ticks = 0;
+	static uint32_t prev_total_ticks = 0;
+	int cpu_pct = -1;  // -1 = unavailable
+
+	TaskHandle_t idle_h = xTaskGetIdleTaskHandle();
+	if (idle_h) {
+		TaskStatus_t idle_info;
+		vTaskGetInfo(idle_h, &idle_info, pdFALSE, eRunning);
+		uint32_t total_now = (uint32_t)(esp_timer_get_time() / 1000);  // ms
+		uint32_t idle_now = idle_info.ulRunTimeCounter / 1000;  // us→ms
+		uint32_t dt = total_now - prev_total_ticks;
+		uint32_t di = idle_now - prev_idle_ticks;
+		if (dt > 0) {
+			int idle_pct = (int)(di * 100 / dt);
+			cpu_pct = 100 - idle_pct;
+			if (cpu_pct < 0) cpu_pct = 0;
+			if (cpu_pct > 100) cpu_pct = 100;
+		}
+		prev_idle_ticks = idle_now;
+		prev_total_ticks = total_now;
+	}
+
+	commands_printf("ANT BMS: [hb] state=%s conn=%d en=%d | heap=%lu min=%lu | stk tmr=%u can=%u | cpu=%d%%",
+		state_str(), m_connected, m_enabled,
+		(unsigned long)heap_free, (unsigned long)heap_min,
+		(unsigned)stk_tmr, (unsigned)stk_can,
+		cpu_pct);
 
 	// Watchdog: if stuck in IDLE, retry scan
 	if (m_enabled && m_state == ANT_STATE_IDLE && !m_connected && m_gattc_if != ESP_GATT_IF_NONE) {
@@ -771,7 +812,6 @@ static void heartbeat_timer_cb(TimerHandle_t timer) {
 		commands_printf("ANT BMS: stale data watchdog — no valid parse for %d ms, forcing reconnect",
 			ANT_STALE_TIMEOUT_MS);
 		esp_ble_gattc_close(m_gattc_if, m_conn_id);
-		// DISCONNECT_EVT will fire → ant_handle_disconnect() → reconnect timer
 	}
 }
 
@@ -1170,12 +1210,15 @@ void ant_bms_init(void) {
 		pdFALSE, NULL, reconnect_timer_cb
 	);
 
-	// Heartbeat timer — prints state every 10s for diagnostics
+	// Heartbeat timer — prints state + resources every 10s
 	m_heartbeat_timer = xTimerCreate(
 		"ant_hb", pdMS_TO_TICKS(10000),
 		pdTRUE, NULL, heartbeat_timer_cb
 	);
 	xTimerStart(m_heartbeat_timer, 0);
+
+	// Dedicated CAN task — decoupled from BLE callback context
+	xTaskCreatePinnedToCore(ant_can_task, "ant_can", 2048, NULL, 5, &m_can_task, tskNO_AFFINITY);
 
 	// Register terminal command
 	terminal_register_command_callback(
