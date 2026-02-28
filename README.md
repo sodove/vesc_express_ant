@@ -126,7 +126,7 @@ All settings are stored in NVS flash and persist across reboots and OTA updates.
 
 The bridge is enabled by default. The default target MAC is `C3:5E:E2:61:94:AE` (hardcoded in `ant_bms.c`). The default poll interval is 2000ms. With WiFi + BLE Peripheral + BLE Central all active, 500ms poll has been tested stable on ESP32-C3, but 2000ms is the safe default.
 
-**IMPORTANT: Before changing ESC settings through the Express, run `ant_bms disable` first, then `ant_bms enable` after.** The BMS bridge shares the CAN bus with config forwarding. While adaptive backoff minimizes collisions, config writes (especially with the logger running) may fail with "Parameters truncated" if the bridge is active. Disabling the bridge guarantees a clean bus for config operations.
+**WARNING: Writing ESC config with the logger and BMS bridge active can cause "Parameters truncated" errors. A partially written config may leave the ESC in a non-functional state (motor won't spin) until power cycle.** The BMS bridge automatically yields the CAN bus during config forwarding, but the logger generates CAN traffic from the ESC side that cannot be paused by the Express. For reliable config writes: stop the logger first, optionally run `ant_bms disable`. Normal riding (no config writes) is completely safe with everything active.
 
 ### Hardware config
 
@@ -139,7 +139,7 @@ idf.py build -DHW_NAME="sodovaya express"
 ### Safety features
 
 - **Sanity validation**: all parsed values are range-checked before writing to `bms_values` (voltage vs cell count, current, temperatures, SOC/SOH). Invalid frames are dropped entirely.
-- **Adaptive CAN with backoff**: each CAN frame checks bus idle before sending; aborts burst immediately if traffic detected. On collision, backs off for 2 poll cycles (~4-6s) giving config forwarding and logger uncontested access. No force-send timeout — ESC handles staleness via its own 2-second `MAX_CAN_AGE_SEC` fail-open.
+- **CAN forwarding yield**: BMS frames are suppressed while `comm_can_send_buffer()` is sending a multi-frame config burst (via `comm_can_is_forwarding()` flag). Additionally, each BMS CAN frame checks bus idle before sending and aborts the burst if traffic is detected. No force-send timeout — ESC handles staleness via its own 2-second `MAX_CAN_AGE_SEC` fail-open.
 - **Stale data watchdog**: if connected but no valid parse for 30 seconds (BMS stopped responding), forces BLE disconnect and reconnect.
 - **Disconnect cleanup**: on BLE disconnect, `bms_values.update_time` is zeroed so ESC times out and removes BMS current limits (fail-open design).
 
