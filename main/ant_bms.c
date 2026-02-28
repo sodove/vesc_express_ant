@@ -670,12 +670,13 @@ static void ant_handle_disconnect(void) {
 
 	if (m_poll_timer) xTimerStop(m_poll_timer, 0);
 
-	// Invalidate Express-local bms_values so:
-	// 1. Direct queries (COMM_BMS_GET_VALUES via WiFi) see stale update_time
+	// Clear Express-local bms_values so:
+	// 1. COMM_BMS_GET_VALUES returns zeros (VESC Tool shows empty BMS page)
 	// 2. CAN sends were already stopped (only happen inside ant_parse_status)
 	// 3. ESC will timeout via MAX_CAN_AGE_SEC and remove BMS limits (fail-open)
 	volatile bms_values *val = bms_get_values();
-	val->update_time = 0;
+	memset((void *)val, 0, sizeof(bms_values));
+	val->can_id = -1;
 
 	commands_printf("ANT BMS: disconnected, reconnecting in %d ms", ANT_RECONNECT_DELAY_MS);
 
@@ -1134,9 +1135,10 @@ static void ant_terminal_cmd(int argc, const char **argv) {
 
 		m_state = ANT_STATE_IDLE;
 
-		// Invalidate BMS data
+		// Clear BMS data so VESC Tool shows empty BMS page
 		volatile bms_values *val = bms_get_values();
-		val->update_time = 0;
+		memset((void *)val, 0, sizeof(bms_values));
+		val->can_id = -1;
 
 		commands_printf("ANT BMS: disabled (saved), BLE disconnected");
 		return;
