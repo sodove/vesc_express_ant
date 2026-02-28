@@ -97,8 +97,13 @@ Cell voltages (up to 32)    u16LE millivolts @ offset 34
 Total voltage               u16LE * 0.01V
 Current                     i16LE * 0.1A
 SOC                         u16LE (%)
-Temperatures + MOS temp     u16LE direct °C
-Charge/discharge state      u8 flags
+SOH                         u16LE (%)
+Cell temperatures           u16LE direct °C (65496 = no sensor)
+MOS temperature             u16LE direct °C  ->  Temp PCB in VESC Tool (max of MOS and balancer)
+Balancer temperature        u16LE direct °C  ->  Temp Hum in VESC Tool (MOS temp separately)
+Charge/discharge switches   u8 flags
+Balancer state              u16LE bitmask (1 bit per cell)
+Remaining capacity          u32LE * 0.000001 Ah  ->  Ah counter + Wh counter in VESC Tool
 ```
 
 ### Terminal commands
@@ -106,7 +111,9 @@ Charge/discharge state      u8 flags
 Connect to the Express via VESC Tool > VESC Dev Tools > Terminal:
 
 ```
-ant_bms                            show status (MAC, state, BMS data)
+ant_bms                            show status: MAC, state, voltage, current, SOC, SOH,
+                                     cells, temps, Temp PCB (MOS/BAL breakdown),
+                                     remaining Ah/Wh, balancing state, charge allowed
 ant_bms mac XX:XX:XX:XX:XX:XX     change target BMS MAC (saved to NVS, reboot to apply)
 ant_bms poll 500                   change poll interval in ms (500-10000, applied immediately, saved to NVS)
 ```
