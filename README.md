@@ -126,7 +126,7 @@ All settings are stored in NVS flash and persist across reboots and OTA updates.
 
 The bridge is enabled by default. The default target MAC is `C3:5E:E2:61:94:AE` (hardcoded in `ant_bms.c`). The default poll interval is 2000ms. With WiFi + BLE Peripheral + BLE Central all active, 500ms poll has been tested stable on ESP32-C3, but 2000ms is the safe default.
 
-**WARNING: Writing ESC config with the logger and BMS bridge active can cause "Parameters truncated" errors. A partially written config may leave the ESC in a non-functional state (motor won't spin) until power cycle.** The BMS bridge automatically yields the CAN bus during config forwarding, but the logger generates CAN traffic from the ESC side that cannot be paused by the Express. For reliable config writes: stop the logger first, optionally run `ant_bms disable`. Normal riding (no config writes) is completely safe with everything active.
+**WARNING: Writing ESC config with the logger and BMS bridge active can cause "Parameters truncated" errors. A partially written config may leave the ESC in a non-functional state (motor won't spin) — recoverable by power cycle, or potentially permanently if corrupted values damage hardware settings.** The BMS bridge automatically yields the CAN bus during config forwarding, but the logger generates CAN traffic from the ESC side that cannot be paused by the Express. For reliable config writes: stop the logger first, optionally run `ant_bms disable`. Normal riding (no config writes) is completely safe with everything active.
 
 ### Hardware config
 
