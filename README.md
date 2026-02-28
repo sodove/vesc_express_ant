@@ -88,7 +88,7 @@ The ESP32-C3 runs three radios simultaneously:
 - BLE Peripheral (GATTS) — VESC Tool mobile connection
 - BLE Central (GATTC) — ANT BMS connection
 
-On boot, the Express scans for the configured ANT BMS MAC address, connects via BLE, subscribes to notifications on the 0xFFE1 characteristic, and polls for status every 2 seconds. Parsed data is written into the VESC `bms_values` struct and sent over CAN via `bms_send_status_can()`.
+On boot (if enabled), the Express scans for the configured ANT BMS MAC address, connects via BLE, subscribes to notifications on the 0xFFE1 characteristic, and polls for status every 2 seconds. Parsed data is validated, written into the VESC `bms_values` struct, and sent over CAN with adaptive rate limiting that yields to config forwarding traffic.
 
 ### Data forwarded
 
@@ -111,18 +111,22 @@ Remaining capacity          u32LE * 0.000001 Ah  ->  Ah counter + Wh counter in 
 Connect to the Express via VESC Tool > VESC Dev Tools > Terminal:
 
 ```
-ant_bms                            show status: MAC, state, voltage, current, SOC, SOH,
-                                     cells, temps, Temp PCB (MOS/BAL breakdown),
+ant_bms                            show status: enabled, MAC, state, voltage, current,
+                                     SOC, SOH, cells, temps, Temp PCB (MOS/BAL breakdown),
                                      remaining Ah/Wh, balancing state, charge allowed
+ant_bms enable                     enable bridge (starts BLE scan, saved to NVS)
+ant_bms disable                    disable bridge (disconnects BLE, clears BMS data, saved to NVS)
 ant_bms mac XX:XX:XX:XX:XX:XX     change target BMS MAC (saved to NVS, reboot to apply)
 ant_bms poll 500                   change poll interval in ms (500-10000, applied immediately, saved to NVS)
 ```
 
 ### Configuration
 
-The default target MAC is `C3:5E:E2:61:94:AE` (hardcoded in `ant_bms.c`). Change it at runtime via the terminal command above — it persists across reboots and OTA updates (stored in NVS flash).
+All settings are stored in NVS flash and persist across reboots and OTA updates.
 
-The default poll interval is 2000ms. With WiFi + BLE Peripheral + BLE Central all active, 500ms has been tested stable on ESP32-C3, but 2000ms is the safe default.
+The bridge is enabled by default. The default target MAC is `C3:5E:E2:61:94:AE` (hardcoded in `ant_bms.c`). The default poll interval is 2000ms. With WiFi + BLE Peripheral + BLE Central all active, 500ms poll has been tested stable on ESP32-C3, but 2000ms is the safe default.
+
+**Tip:** When changing ESC configuration via VESC Tool through the Express (CAN forwarding), it is recommended to run `ant_bms disable` beforehand and `ant_bms enable` after. The adaptive CAN logic yields to config traffic, but disabling the bridge eliminates any possibility of bus contention during config writes.
 
 ### Hardware config
 
@@ -132,15 +136,24 @@ The `hw_sodovaya` config is based on `hw_xp_t` (VESC Express T) with the same pi
 idf.py build -DHW_NAME="sodovaya express"
 ```
 
+### Safety features
+
+- **Sanity validation**: all parsed values are range-checked before writing to `bms_values` (voltage vs cell count, current, temperatures, SOC/SOH). Invalid frames are dropped entirely.
+- **Adaptive CAN**: each CAN frame checks bus idle before sending; aborts burst immediately if config forwarding traffic is detected. No force-send timeout — ESC handles staleness via its own 2-second `MAX_CAN_AGE_SEC` fail-open.
+- **Stale data watchdog**: if connected but no valid parse for 30 seconds (BMS stopped responding), forces BLE disconnect and reconnect.
+- **Disconnect cleanup**: on BLE disconnect, `bms_values.update_time` is zeroed so ESC times out and removes BMS current limits (fail-open design).
+
 ### Files
 
 ```
-main/ant_bms.c              BLE GATTC bridge: scan, connect, discover, subscribe, poll, parse, CAN send
+main/ant_bms.c              BLE GATTC bridge: scan, connect, discover, subscribe, poll,
+                              parse, sanity check, adaptive CAN send, enable/disable
 main/ant_bms.h              Public API (ant_bms_init, ant_bms_is_connected)
 main/hwconf/hw_sodovaya.h   Hardware config (ESP32-C3, same pinout as Express T)
 main/hwconf/hw_sodovaya.c   Hardware init
 main/comm_ble.c             Added GAP event hook for GATTC scan coexistence
 main/comm_ble.h             Exported comm_ble_set_gap_hook()
+main/log.c                  Ported upstream race condition fix (m_field_mutex)
 main/main.c                 ant_bms_init() call after WiFi init
 sdkconfig.defaults          GATTC enabled, BLE MAX_ACT=6, increased BT stack sizes
 ```

@@ -35,6 +35,9 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 typedef struct {
 	char key[25];
 	char name[30];
@@ -67,6 +70,7 @@ static log_header m_header_hvel;
 
 static volatile int m_field_num = 0;
 static volatile float m_rate_hz = 10.0;
+static SemaphoreHandle_t m_field_mutex;
 static volatile bool m_append_time = false;
 static volatile bool m_append_gnss = false;
 static volatile bool m_append_gnss_time = false;
@@ -215,11 +219,30 @@ static void log_task(void *arg) {
 		}
 
 		if (f_log) {
+			// Snapshot field values under mutex to prevent race with log_process_packet
+			double snap_val[LOG_MAX_FIELDS];
+			bool snap_upd[LOG_MAX_FIELDS];
+			int8_t snap_prec[LOG_MAX_FIELDS];
+
+			xSemaphoreTake(m_field_mutex, portMAX_DELAY);
 			for (int i = 0;i < m_field_num;i++) {
-				log_header *h = (log_header*)&m_headers[i];
-				if (h->updated) {
-					fprintf(f_log, "%.*f", h->precision, h->value);
-					h->updated = false;
+				snap_val[i] = m_headers[i].value;
+				snap_upd[i] = m_headers[i].updated;
+				snap_prec[i] = m_headers[i].precision;
+				m_headers[i].updated = false;
+			}
+			xSemaphoreGive(m_field_mutex);
+
+			// Skip row if no fields were updated
+			bool any_updated = false;
+			for (int i = 0;i < m_field_num;i++) {
+				if (snap_upd[i]) { any_updated = true; break; }
+			}
+			if (!any_updated) { continue; }
+
+			for (int i = 0;i < m_field_num;i++) {
+				if (snap_upd[i]) {
+					fprintf(f_log, "%.*f", snap_prec[i], snap_val[i]);
 				}
 				if (i == (m_field_num - 1)) {
 					if (m_append_time || m_append_gnss_time || m_append_gnss) {
@@ -469,6 +492,7 @@ bool log_init(void) {
 	m_header_hvel.value = 0.0;
 	m_header_hvel.updated = false;
 
+	m_field_mutex = xSemaphoreCreateMutex();
 	xTaskCreatePinnedToCore(log_task, "log", 3072, NULL, 8, NULL, tskNO_AFFINITY);
 
 	return true;
@@ -531,11 +555,13 @@ void log_process_packet(unsigned char *data, unsigned int len) {
 			break;
 		}
 
+		xSemaphoreTake(m_field_mutex, portMAX_DELAY);
 		while (field_ind < LOG_MAX_FIELDS && ind < len) {
 			m_headers[field_ind].value = buffer_get_float32_auto(data, &ind);
 			m_headers[field_ind].updated = true;
 			field_ind++;
 		}
+		xSemaphoreGive(m_field_mutex);
 	} break;
 
 	case COMM_LOG_DATA_F64: {
@@ -546,11 +572,13 @@ void log_process_packet(unsigned char *data, unsigned int len) {
 			break;
 		}
 
+		xSemaphoreTake(m_field_mutex, portMAX_DELAY);
 		while (field_ind < LOG_MAX_FIELDS && ind < len) {
 			m_headers[field_ind].value = buffer_get_float64_auto(data, &ind);
 			m_headers[field_ind].updated = true;
 			field_ind++;
 		}
+		xSemaphoreGive(m_field_mutex);
 	} break;
 
 	default:

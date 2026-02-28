@@ -37,7 +37,9 @@
 #include "driver/twai.h"
 
 #include "bms.h"
+#include "buffer.h"
 #include "comm_ble.h"
+#include "comm_can.h"
 #include "commands.h"
 #include "terminal.h"
 #include "conf_general.h"
@@ -63,10 +65,22 @@
 // Response buffer
 #define ANT_RX_BUF_SIZE   512
 
+// Sanity limits for parsed BMS data
+// Voltage limits are computed dynamically: cell_count * ANT_V_CELL_MAX/MIN
+#define ANT_V_CELL_FLOOR      0.5f    // Min reasonable cell voltage (V) — deep-discharged LTO
+#define ANT_V_CELL_CEIL       5.0f    // Max reasonable cell voltage (V) — covers Li-ion, LiFePO4, LTO
+#define ANT_CURRENT_MAX        500.0f  // Max |current| (A)
+#define ANT_TEMP_MIN          -40.0f   // Min temperature (°C)
+#define ANT_TEMP_MAX           200.0f  // Max temperature (°C)
+
+// Stale data watchdog: force reconnect if connected but no valid parse for this long
+#define ANT_STALE_TIMEOUT_MS   30000
+
 // NVS namespace + keys
 #define NVS_NAMESPACE  "ant_bms"
 #define NVS_KEY_MAC    "mac"
 #define NVS_KEY_POLL   "poll_ms"
+#define NVS_KEY_EN     "enabled"
 
 // Default MAC: C3:5E:E2:61:94:AE
 static const esp_bd_addr_t ant_bms_mac_default = {0xC3, 0x5E, 0xE2, 0x61, 0x94, 0xAE};
@@ -74,6 +88,7 @@ static const esp_bd_addr_t ant_bms_mac_default = {0xC3, 0x5E, 0xE2, 0x61, 0x94, 
 // Runtime config (loaded from NVS at init)
 static esp_bd_addr_t ant_bms_mac;
 static uint32_t m_poll_interval_ms = ANT_POLL_INTERVAL_DEFAULT;
+static volatile bool m_enabled = true;
 
 // State machine
 typedef enum {
@@ -102,6 +117,9 @@ static int m_rx_len = 0;
 // Last parsed MOS/BAL temps for terminal display
 static float m_temp_mos = 0.0f;
 static float m_temp_bal = 0.0f;
+
+// Timestamp of last successful parse (for stale data watchdog)
+static volatile uint32_t m_last_parse_time = 0;
 
 // Timers
 static TimerHandle_t m_poll_timer = NULL;
@@ -171,6 +189,118 @@ static inline uint32_t rd_u32le(const uint8_t *buf, int off) {
 		((uint32_t)buf[off + 1] << 8) |
 		((uint32_t)buf[off + 2] << 16) |
 		((uint32_t)buf[off + 3] << 24);
+}
+
+// ============================================================================
+// BMS CAN sender — spreads frames with vTaskDelay to avoid TX queue overflow.
+// Sends only essential packets (skips empty STATUS_1..5, CHG/DIS totals).
+// ============================================================================
+
+// Returns true if CAN TX queue is empty (safe to send a frame).
+// If bus is busy, yields once and rechecks; returns false if still busy.
+static bool ant_can_bus_idle(void) {
+	twai_status_info_t info;
+	if (twai_get_status_info(&info) != ESP_OK) return false;
+	if (info.msgs_to_tx == 0) return true;
+	// Bus busy — yield and recheck once
+	vTaskDelay(1);
+	if (twai_get_status_info(&info) != ESP_OK) return false;
+	return (info.msgs_to_tx == 0);
+}
+
+// Send one CAN frame if bus is idle. Returns false if bus was busy (burst aborted).
+static bool ant_can_send_frame(uint32_t eid, uint8_t *data, int len) {
+	if (!ant_can_bus_idle()) return false;
+	comm_can_transmit_eid(eid, data, len);
+	vTaskDelay(1);
+	return true;
+}
+
+static void ant_bms_send_can(void) {
+	int32_t si = 0;
+	uint8_t buf[8];
+	volatile bms_values *v = bms_get_values();
+	uint8_t id = backup.config.controller_id;
+
+	// V_TOT
+	si = 0;
+	buffer_append_float32_auto(buf, v->v_tot, &si);
+	buffer_append_float32_auto(buf, v->v_charge, &si);
+	if (!ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_V_TOT << 8), buf, si)) return;
+
+	// I
+	si = 0;
+	buffer_append_float32_auto(buf, v->i_in, &si);
+	buffer_append_float32_auto(buf, v->i_in_ic, &si);
+	if (!ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_I << 8), buf, si)) return;
+
+	// AH_WH
+	si = 0;
+	buffer_append_float32_auto(buf, v->ah_cnt, &si);
+	buffer_append_float32_auto(buf, v->wh_cnt, &si);
+	if (!ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_AH_WH << 8), buf, si)) return;
+
+	// V_CELL (3 cells per frame)
+	int cell_max = v->cell_num;
+	if (cell_max > BMS_MAX_CELLS) cell_max = BMS_MAX_CELLS;
+	int cell_now = 0;
+	while (cell_now < cell_max) {
+		si = 0;
+		buf[si++] = cell_now;
+		buf[si++] = v->cell_num;
+		if (cell_now < cell_max) buffer_append_float16(buf, v->v_cell[cell_now++], 1e3, &si);
+		if (cell_now < cell_max) buffer_append_float16(buf, v->v_cell[cell_now++], 1e3, &si);
+		if (cell_now < cell_max) buffer_append_float16(buf, v->v_cell[cell_now++], 1e3, &si);
+		if (!ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_V_CELL << 8), buf, si)) return;
+	}
+
+	// BAL
+	si = 0;
+	buf[si++] = cell_max;
+	uint64_t bal = 0;
+	for (int i = 0; i < cell_max; i++) bal |= (uint64_t)v->bal_state[i] << i;
+	buf[si++] = (bal >> 48) & 0xFF;
+	buf[si++] = (bal >> 40) & 0xFF;
+	buf[si++] = (bal >> 32) & 0xFF;
+	buf[si++] = (bal >> 24) & 0xFF;
+	buf[si++] = (bal >> 16) & 0xFF;
+	buf[si++] = (bal >> 8) & 0xFF;
+	buf[si++] = (bal >> 0) & 0xFF;
+	if (!ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_BAL << 8), buf, si)) return;
+
+	// TEMPS (3 temps per frame)
+	int temp_max = v->temp_adc_num;
+	if (temp_max > BMS_MAX_TEMPS) temp_max = BMS_MAX_TEMPS;
+	int temp_now = 0;
+	while (temp_now < temp_max) {
+		si = 0;
+		buf[si++] = temp_now;
+		buf[si++] = temp_max;
+		if (temp_now < temp_max) buffer_append_float16(buf, v->temps_adc[temp_now++], 1e2, &si);
+		if (temp_now < temp_max) buffer_append_float16(buf, v->temps_adc[temp_now++], 1e2, &si);
+		if (temp_now < temp_max) buffer_append_float16(buf, v->temps_adc[temp_now++], 1e2, &si);
+		if (!ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_TEMPS << 8), buf, si)) return;
+	}
+
+	// HUM (temp_hum, hum, temp_ic)
+	si = 0;
+	buffer_append_float16(buf, v->temp_hum, 1e2, &si);
+	buffer_append_float16(buf, v->hum, 1e2, &si);
+	buffer_append_float16(buf, v->temp_ic, 1e2, &si);
+	if (!ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_HUM << 8), buf, si)) return;
+
+	// SOC_SOH_TEMP_STAT
+	si = 0;
+	buffer_append_float16(buf, v->v_cell_min, 1e3, &si);
+	buffer_append_float16(buf, v->v_cell_max, 1e3, &si);
+	buf[si++] = (uint8_t)(v->soc * 255.0f);
+	buf[si++] = (uint8_t)(v->soh * 255.0f);
+	buf[si++] = (int8_t)v->temp_max_cell;
+	buf[si++] =
+		((v->is_charging ? 1 : 0) << 0) |
+		((v->is_balancing ? 1 : 0) << 1) |
+		((v->is_charge_allowed ? 1 : 0) << 2);
+	ant_can_send_frame(id | ((uint32_t)CAN_PACKET_BMS_SOC_SOH_TEMP_STAT << 8), buf, si);
 }
 
 static void ant_parse_status(const uint8_t *buf, int frame_len) {
@@ -275,6 +405,53 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 		pos += 2;
 	}
 
+	// ---- Sanity validation ----
+	// Reject entire frame if critical values are obviously wrong.
+	// CRC passed, so transport is intact — but BMS firmware could send garbage.
+
+	if (actual_cells < 1) {
+		commands_printf("ANT BMS: sanity fail — no valid cells");
+		return;
+	}
+
+	// Dynamic voltage limits based on cell count
+	float v_tot_min = (float)actual_cells * ANT_V_CELL_FLOOR;
+	float v_tot_max = (float)actual_cells * ANT_V_CELL_CEIL;
+
+	if (v_tot < v_tot_min || v_tot > v_tot_max) {
+		commands_printf("ANT BMS: sanity fail v_tot=%.2f (range %.1f-%.1f for %dS)",
+			(double)v_tot, (double)v_tot_min, (double)v_tot_max, actual_cells);
+		return;
+	}
+
+	if (fabsf(current) > ANT_CURRENT_MAX) {
+		commands_printf("ANT BMS: sanity fail current=%.1f (max %.0f)",
+			(double)current, (double)ANT_CURRENT_MAX);
+		return;
+	}
+
+	// Clamp SOC/SOH to 0-100 (don't reject — just clamp)
+	if (soc < 0.0f) soc = 0.0f;
+	if (soc > 100.0f) soc = 100.0f;
+	if (soh < 0.0f) soh = 0.0f;
+	if (soh > 100.0f) soh = 100.0f;
+
+	// Reject temperatures outside sane range
+	for (int i = 0; i < actual_temps; i++) {
+		if (temps[i] < ANT_TEMP_MIN || temps[i] > ANT_TEMP_MAX) {
+			commands_printf("ANT BMS: sanity fail temp[%d]=%.0f", i, (double)temps[i]);
+			return;
+		}
+	}
+	if (mos_temp > -273.0f && (mos_temp < ANT_TEMP_MIN || mos_temp > ANT_TEMP_MAX)) {
+		commands_printf("ANT BMS: sanity fail mos_temp=%.0f", (double)mos_temp);
+		return;
+	}
+	if (bal_temp > -273.0f && (bal_temp < ANT_TEMP_MIN || bal_temp > ANT_TEMP_MAX)) {
+		commands_printf("ANT BMS: sanity fail bal_temp=%.0f", (double)bal_temp);
+		return;
+	}
+
 	// Switch states
 	bool discharge_enabled = false;
 	bool charge_enabled = false;
@@ -307,6 +484,9 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 		remaining_ah = (float)rd_u32le(buf, pos) * 0.000001f;
 		pos += 4;
 	}
+
+	// All sanity checks passed — mark parse success
+	m_last_parse_time = xTaskGetTickCount();
 
 	// Write into VESC bms_values
 	volatile bms_values *val = bms_get_values();
@@ -346,10 +526,12 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 	val->can_id = backup.config.controller_id;
 	val->update_time = xTaskGetTickCount();
 
-	// Adaptive CAN send: check bus load before sending ~22 BMS packets.
-	// If bus is busy (config forwarding etc), back off automatically.
-	// If bus is idle, send every poll cycle (= m_poll_interval_ms).
-	// Force send at least every 10s even under load.
+	// Adaptive CAN send with inter-frame yields.
+	// Unlike bms_send_status_can() which blasts ~22 frames in a tight loop
+	// (overflowing the 20-entry TX queue), we send only essential packets
+	// with vTaskDelay(1) between each to let CAN forwarding traffic through.
+	// Only send when bus is idle — no force timeout, ESC handles staleness
+	// via MAX_CAN_AGE_SEC (2s) fail-open on its own.
 	static uint32_t last_can_send = 0;
 	uint32_t now = xTaskGetTickCount();
 	uint32_t elapsed = now - last_can_send;
@@ -360,10 +542,9 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 
 	uint32_t interval = m_poll_interval_ms < 500 ? 500 : m_poll_interval_ms;
 
-	if ((bus_idle && elapsed >= pdMS_TO_TICKS(interval)) ||
-		elapsed >= pdMS_TO_TICKS(10000)) {
+	if (bus_idle && elapsed >= pdMS_TO_TICKS(interval)) {
 		last_can_send = now;
-		bms_send_status_can();
+		ant_bms_send_can();
 	}
 }
 
@@ -457,7 +638,7 @@ static void ant_start_scan(void);
 static void ant_try_connect(void);
 
 static void ant_send_poll_cmd(void) {
-	if (m_state != ANT_STATE_POLLING || !m_connected) return;
+	if (!m_enabled || m_state != ANT_STATE_POLLING || !m_connected) return;
 
 	uint8_t cmd[10];
 	int cmd_len = ant_build_status_cmd(cmd);
@@ -477,7 +658,7 @@ static void poll_timer_cb(TimerHandle_t timer) {
 
 static void reconnect_timer_cb(TimerHandle_t timer) {
 	(void)timer;
-	if (!m_connected && m_state == ANT_STATE_IDLE) {
+	if (m_enabled && !m_connected && m_state == ANT_STATE_IDLE) {
 		ant_start_scan();
 	}
 }
@@ -488,6 +669,13 @@ static void ant_handle_disconnect(void) {
 	m_rx_len = 0;
 
 	if (m_poll_timer) xTimerStop(m_poll_timer, 0);
+
+	// Invalidate Express-local bms_values so:
+	// 1. Direct queries (COMM_BMS_GET_VALUES via WiFi) see stale update_time
+	// 2. CAN sends were already stopped (only happen inside ant_parse_status)
+	// 3. ESC will timeout via MAX_CAN_AGE_SEC and remove BMS limits (fail-open)
+	volatile bms_values *val = bms_get_values();
+	val->update_time = 0;
 
 	commands_printf("ANT BMS: disconnected, reconnecting in %d ms", ANT_RECONNECT_DELAY_MS);
 
@@ -565,12 +753,24 @@ static const char *state_str(void) {
 
 static void heartbeat_timer_cb(TimerHandle_t timer) {
 	(void)timer;
-	commands_printf("ANT BMS: [hb v3] state=%s if=%d c=%d",
+	commands_printf("ANT BMS: [hb v4] state=%s if=%d c=%d",
 		state_str(), m_gattc_if, m_connected);
+
 	// Watchdog: if stuck in IDLE, retry scan
-	if (m_state == ANT_STATE_IDLE && !m_connected && m_gattc_if != ESP_GATT_IF_NONE) {
+	if (m_enabled && m_state == ANT_STATE_IDLE && !m_connected && m_gattc_if != ESP_GATT_IF_NONE) {
 		commands_printf("ANT BMS: [hb] retrying scan...");
 		ant_start_scan();
+	}
+
+	// Stale data watchdog: connected but no valid parse for too long.
+	// BLE link might be up but BMS stopped responding (EMI, firmware hang, etc).
+	// Force disconnect → reconnect cycle to recover.
+	if (m_connected && m_last_parse_time > 0 &&
+		(xTaskGetTickCount() - m_last_parse_time) > pdMS_TO_TICKS(ANT_STALE_TIMEOUT_MS)) {
+		commands_printf("ANT BMS: stale data watchdog — no valid parse for %d ms, forcing reconnect",
+			ANT_STALE_TIMEOUT_MS);
+		esp_ble_gattc_close(m_gattc_if, m_conn_id);
+		// DISCONNECT_EVT will fire → ant_handle_disconnect() → reconnect timer
 	}
 }
 
@@ -633,8 +833,8 @@ static void ant_gattc_event_handler(
 
 		if (param->reg.status == ESP_GATT_OK) {
 			m_gattc_if = gattc_if;
-			commands_printf("ANT BMS: GATTC registered (if=%d), starting scan...", gattc_if);
-			ant_start_scan();
+			commands_printf("ANT BMS: GATTC registered (if=%d, enabled=%d)", gattc_if, m_enabled);
+			if (m_enabled) ant_start_scan();
 		} else {
 			commands_printf("ANT BMS: GATTC register failed (%d)", param->reg.status);
 		}
@@ -645,6 +845,7 @@ static void ant_gattc_event_handler(
 		if (param->open.status == ESP_GATT_OK) {
 			m_conn_id = param->open.conn_id;
 			m_connected = true;
+			m_last_parse_time = xTaskGetTickCount(); // reset watchdog on connect
 			m_state = ANT_STATE_DISCOVERING;
 			commands_printf("ANT BMS: connected (conn_id=%d), discovering svc 0x%04X", m_conn_id, ANT_SERVICE_UUID);
 			esp_bt_uuid_t svc_filter = {
@@ -771,12 +972,17 @@ static void ant_gattc_event_handler(
 static void ant_nvs_load(void) {
 	memcpy(ant_bms_mac, ant_bms_mac_default, sizeof(esp_bd_addr_t));
 	m_poll_interval_ms = ANT_POLL_INTERVAL_DEFAULT;
+	m_enabled = true;
 
 	nvs_handle_t h;
 	if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
 		size_t len = sizeof(esp_bd_addr_t);
 		nvs_get_blob(h, NVS_KEY_MAC, ant_bms_mac, &len);
 		nvs_get_u32(h, NVS_KEY_POLL, &m_poll_interval_ms);
+		uint8_t en = 1;
+		if (nvs_get_u8(h, NVS_KEY_EN, &en) == ESP_OK) {
+			m_enabled = (en != 0);
+		}
 		nvs_close(h);
 	}
 }
@@ -799,6 +1005,15 @@ static void ant_nvs_save_poll(void) {
 	}
 }
 
+static void ant_nvs_save_enabled(void) {
+	nvs_handle_t h;
+	if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+		nvs_set_u8(h, NVS_KEY_EN, m_enabled ? 1 : 0);
+		nvs_commit(h);
+		nvs_close(h);
+	}
+}
+
 // ============================================================================
 // Terminal command: ant_bms [status|mac XX:XX:XX:XX:XX:XX|poll <ms>]
 // ============================================================================
@@ -816,6 +1031,7 @@ static int parse_mac(const char *str, esp_bd_addr_t out) {
 static void ant_terminal_cmd(int argc, const char **argv) {
 	if (argc < 2 || strcmp(argv[1], "status") == 0) {
 		commands_printf("ANT BMS status:");
+		commands_printf("  Enabled:   %s", m_enabled ? "yes" : "no");
 		commands_printf("  MAC:       %02X:%02X:%02X:%02X:%02X:%02X",
 			ant_bms_mac[0], ant_bms_mac[1], ant_bms_mac[2],
 			ant_bms_mac[3], ant_bms_mac[4], ant_bms_mac[5]);
@@ -881,7 +1097,52 @@ static void ant_terminal_cmd(int argc, const char **argv) {
 		return;
 	}
 
-	commands_printf("Usage: ant_bms [status|mac XX:XX:XX:XX:XX:XX|poll <ms>]");
+	if (strcmp(argv[1], "enable") == 0) {
+		if (m_enabled) {
+			commands_printf("ANT BMS: already enabled");
+			return;
+		}
+		m_enabled = true;
+		ant_nvs_save_enabled();
+		commands_printf("ANT BMS: enabled (saved), starting scan...");
+		if (m_gattc_if != ESP_GATT_IF_NONE) {
+			ant_start_scan();
+		}
+		return;
+	}
+
+	if (strcmp(argv[1], "disable") == 0) {
+		if (!m_enabled) {
+			commands_printf("ANT BMS: already disabled");
+			return;
+		}
+		m_enabled = false;
+		ant_nvs_save_enabled();
+
+		// Stop timers
+		if (m_poll_timer) xTimerStop(m_poll_timer, 0);
+
+		// Disconnect if connected
+		if (m_connected && m_gattc_if != ESP_GATT_IF_NONE) {
+			esp_ble_gattc_close(m_gattc_if, m_conn_id);
+		}
+
+		// Stop ongoing scan
+		if (m_state == ANT_STATE_SCANNING) {
+			esp_ble_gap_stop_scanning();
+		}
+
+		m_state = ANT_STATE_IDLE;
+
+		// Invalidate BMS data
+		volatile bms_values *val = bms_get_values();
+		val->update_time = 0;
+
+		commands_printf("ANT BMS: disabled (saved), BLE disconnected");
+		return;
+	}
+
+	commands_printf("Usage: ant_bms [status|enable|disable|mac XX:XX:XX:XX:XX:XX|poll <ms>]");
 }
 
 // ============================================================================
@@ -891,10 +1152,11 @@ static void ant_terminal_cmd(int argc, const char **argv) {
 void ant_bms_init(void) {
 	ant_nvs_load();
 
-	commands_printf("ANT BMS: init (target %02X:%02X:%02X:%02X:%02X:%02X, poll %lu ms)",
+	commands_printf("ANT BMS: init (target %02X:%02X:%02X:%02X:%02X:%02X, poll %lu ms, %s)",
 		ant_bms_mac[0], ant_bms_mac[1], ant_bms_mac[2],
 		ant_bms_mac[3], ant_bms_mac[4], ant_bms_mac[5],
-		(unsigned long)m_poll_interval_ms);
+		(unsigned long)m_poll_interval_ms,
+		m_enabled ? "enabled" : "disabled");
 
 	m_poll_timer = xTimerCreate(
 		"ant_poll", pdMS_TO_TICKS(m_poll_interval_ms),
@@ -917,7 +1179,7 @@ void ant_bms_init(void) {
 	terminal_register_command_callback(
 		"ant_bms",
 		"ANT BMS bridge control",
-		"[status|mac XX:XX:XX:XX:XX:XX|poll <ms>]",
+		"[status|enable|disable|mac XX:XX:XX:XX:XX:XX|poll <ms>]",
 		ant_terminal_cmd
 	);
 
