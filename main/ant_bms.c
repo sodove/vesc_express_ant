@@ -97,6 +97,10 @@ static esp_ble_addr_type_t m_found_addr_type = BLE_ADDR_TYPE_PUBLIC;
 static uint8_t m_rx_buf[ANT_RX_BUF_SIZE];
 static int m_rx_len = 0;
 
+// Last parsed MOS/BAL temps for terminal display
+static float m_temp_mos = 0.0f;
+static float m_temp_bal = 0.0f;
+
 // Timers
 static TimerHandle_t m_poll_timer = NULL;
 static TimerHandle_t m_reconnect_timer = NULL;
@@ -159,6 +163,14 @@ static inline int16_t rd_i16le(const uint8_t *buf, int off) {
 	return (v >= 0x8000) ? (int16_t)(v - 0x10000) : (int16_t)v;
 }
 
+// Helper: read uint32 little-endian from buffer
+static inline uint32_t rd_u32le(const uint8_t *buf, int off) {
+	return (uint32_t)buf[off] |
+		((uint32_t)buf[off + 1] << 8) |
+		((uint32_t)buf[off + 2] << 16) |
+		((uint32_t)buf[off + 3] << 24);
+}
+
 static void ant_parse_status(const uint8_t *buf, int frame_len) {
 	// Matches Kotlin parseStatus(): offsets are absolute within the frame
 	// Frame: 7E A1 11 XX XX [dataLen] [6..frame header] ... [data] [crc_lo crc_hi] AA 55
@@ -211,18 +223,27 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 		}
 	}
 
-	// MOS temperature
+	// MOS temperature (not added to cell temps — goes to temp_ic)
+	float mos_temp = -273.0f;
 	if (pos + 1 < frame_len) {
-		uint16_t mos_temp = rd_u16le(buf, pos);
+		uint16_t raw = rd_u16le(buf, pos);
 		pos += 2;
-		if (mos_temp != 65496 && actual_temps < BMS_MAX_TEMPS) {
-			temps[actual_temps] = (float)mos_temp;
-			if (temps[actual_temps] > temp_max) temp_max = temps[actual_temps];
-			actual_temps++;
-		}
+		if (raw != 65496) mos_temp = (float)raw;
 	}
 
-	pos += 2; // Skip balancer temp
+	// Balancer temperature (not added to cell temps — goes to temp_hum)
+	float bal_temp = -273.0f;
+	if (pos + 1 < frame_len) {
+		uint16_t raw = rd_u16le(buf, pos);
+		pos += 2;
+		if (raw != 65496) bal_temp = (float)raw;
+	}
+
+	// temp_ic = hottest of MOS and balancer (shown as "Temp PCB" in VESC Tool)
+	// temp_hum = MOS temp separately (shown as "Temp Hum" in VESC Tool)
+	float temp_pcb = -273.0f;
+	if (mos_temp > temp_pcb) temp_pcb = mos_temp;
+	if (bal_temp > temp_pcb) temp_pcb = bal_temp;
 
 	// Total voltage: u16LE * 0.01
 	float v_tot = 0.0f;
@@ -245,6 +266,46 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 		pos += 2;
 	}
 
+	// SOH: u16LE (direct percentage)
+	float soh = 100.0f;
+	if (pos + 1 < frame_len) {
+		soh = (float)rd_u16le(buf, pos);
+		pos += 2;
+	}
+
+	// Switch states
+	bool discharge_enabled = false;
+	bool charge_enabled = false;
+	if (pos < frame_len) {
+		discharge_enabled = (buf[pos] == 1);
+		pos += 1;
+	}
+	if (pos < frame_len) {
+		charge_enabled = (buf[pos] == 1);
+		pos += 1;
+	}
+
+	// Balancer state bitmask (u16LE: bit per cell)
+	uint16_t bal_bitmask = 0;
+	if (pos + 1 < frame_len) {
+		bal_bitmask = rd_u16le(buf, pos);
+		pos += 2;
+	}
+
+	// Capacity: u32LE * 0.000001 (Ah)
+	float capacity_ah = 0.0f;
+	if (pos + 3 < frame_len) {
+		capacity_ah = (float)rd_u32le(buf, pos) * 0.000001f;
+		pos += 4;
+	}
+
+	// Remaining charge: u32LE * 0.000001 (Ah)
+	float remaining_ah = 0.0f;
+	if (pos + 3 < frame_len) {
+		remaining_ah = (float)rd_u32le(buf, pos) * 0.000001f;
+		pos += 4;
+	}
+
 	// Write into VESC bms_values
 	volatile bms_values *val = bms_get_values();
 
@@ -253,12 +314,15 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 	val->i_in = current;
 	val->i_in_ic = current;
 	val->soc = soc / 100.0f;  // VESC expects 0.0-1.0
-	val->soh = 1.0f;
+	val->soh = soh / 100.0f;
 	val->cell_num = actual_cells;
+
+	val->ah_cnt = remaining_ah;
+	val->wh_cnt = remaining_ah * v_tot;
 
 	for (int i = 0; i < actual_cells; i++) {
 		val->v_cell[i] = v_cells[i];
-		val->bal_state[i] = false;
+		val->bal_state[i] = (bal_bitmask >> i) & 1;
 	}
 
 	val->temp_adc_num = actual_temps;
@@ -266,12 +330,18 @@ static void ant_parse_status(const uint8_t *buf, int frame_len) {
 		val->temps_adc[i] = temps[i];
 	}
 
+	val->temp_ic = (temp_pcb > -273.0f) ? temp_pcb : 0.0f;
+	val->temp_hum = (mos_temp > -273.0f) ? mos_temp : 0.0f;
+	m_temp_mos = (mos_temp > -273.0f) ? mos_temp : 0.0f;
+	m_temp_bal = (bal_temp > -273.0f) ? bal_temp : 0.0f;
+
 	val->v_cell_min = v_cell_min;
 	val->v_cell_max = v_cell_max;
 	val->temp_max_cell = temp_max;
 	val->is_charging = (current > 0.05f) ? 1 : 0;
-	val->is_charge_allowed = 1;
-	val->is_balancing = 0;
+	val->is_charge_allowed = charge_enabled ? 1 : 0;
+	val->is_balancing = (bal_bitmask != 0) ? 1 : 0;
+	val->can_id = backup.config.controller_id;
 	val->update_time = xTaskGetTickCount();
 
 	bms_send_status_can();
@@ -738,10 +808,17 @@ static void ant_terminal_cmd(int argc, const char **argv) {
 			commands_printf("  Voltage:   %.2f V", (double)val->v_tot);
 			commands_printf("  Current:   %.1f A", (double)val->i_in);
 			commands_printf("  SOC:       %.0f %%", (double)(val->soc * 100.0f));
+			commands_printf("  SOH:       %.0f %%", (double)(val->soh * 100.0f));
 			commands_printf("  Cells:     %d (%.3f - %.3f V)",
 				val->cell_num, (double)val->v_cell_min, (double)val->v_cell_max);
 			commands_printf("  Temps:     %d (max %.0f C)",
 				val->temp_adc_num, (double)val->temp_max_cell);
+			commands_printf("  Temp PCB:  %.0f C (MOS=%.0f BAL=%.0f)",
+				(double)val->temp_ic, (double)m_temp_mos, (double)m_temp_bal);
+			commands_printf("  Remaining: %.2f Ah / %.1f Wh",
+				(double)val->ah_cnt, (double)val->wh_cnt);
+			commands_printf("  Balancing: %s", val->is_balancing ? "yes" : "no");
+			commands_printf("  Charge OK: %s", val->is_charge_allowed ? "yes" : "no");
 		}
 		return;
 	}
