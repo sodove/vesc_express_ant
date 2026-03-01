@@ -111,6 +111,7 @@ set(COMPONENT_ADD_INCLUDEDIRS
 "hwconf/vesc/vbms16"
 "hwconf/vesc/rmcore"
 "hwconf/vesc/dash16"
+"hwconf/vesc/wcore"
 "hwconf/rescue"
 "hwconf/avaspark"
 
